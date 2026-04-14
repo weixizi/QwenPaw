@@ -9,7 +9,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Type, TYPE_CHECKING
+from typing import Any, List, Literal, Optional, Type, TYPE_CHECKING, TYPE_CHECKING
 
 from agentscope.agent import ReActAgent
 from agentscope.memory import InMemoryMemory
@@ -56,6 +56,7 @@ from ..constant import (
     WORKING_DIR,
 )
 from ..agents.memory import BaseMemoryManager
+from ..plan import PlanStorage, FilePlanStorage, PlanData
 
 if TYPE_CHECKING:
     from ..config.config import AgentProfileConfig
@@ -179,6 +180,10 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
 
         # Register hooks
         self._register_hooks()
+
+        # Initialize plan notebook support (Task-level approach)
+        self._plan_storage: PlanStorage | None = None
+        self._plan_notebook_archive: dict[str, any] = {}
 
     def _create_toolkit(
         self,
@@ -1055,3 +1060,176 @@ class QwenPawAgent(ToolGuardMixin, ReActAgent):
                     "Exception occurred during interrupt cleanup",
                     exc_info=True,
                 )
+
+    # =========================================================
+    # PlanNotebook Support (Task-level dynamic binding)
+    # =========================================================
+
+    def init_plan_storage(self, storage: PlanStorage | None = None) -> PlanStorage:
+        """Initialize plan storage for this agent.
+
+        Args:
+            storage: Optional custom plan storage instance.
+                    If None, creates FilePlanStorage automatically.
+
+        Returns:
+            Plan storage instance
+
+        Note:
+            This uses Task-level approach - each task creates its own
+            PlanNotebook which is temporarily bound to agent.plan_notebook
+            during execution, then archived after completion.
+        """
+        if storage:
+            self._plan_storage = storage
+        else:
+            workspace_dir = Path(self._workspace_dir or WORKING_DIR)
+            agent_id = self._request_context.get("agent_id", "default")
+            self._plan_storage = FilePlanStorage(
+                base_dir=workspace_dir,
+                agent_id=agent_id,
+            )
+        logger.info(
+            f"Initialized plan storage for agent '{agent_id}' "
+            f"at {self._plan_storage.plans_dir}"
+        )
+        return self._plan_storage
+
+    async def create_plan_notebook(
+        self,
+        name: str,
+        description: str,
+        expected_outcome: str,
+        subtasks: list[dict],
+    ) -> Any:
+        """Create a new PlanNotebook for a task.
+
+        Args:
+            name: Plan name
+            description: Plan description
+            expected_outcome: Expected outcome description
+            subtasks: List of subtask definitions, each with:
+                     {name: str, description: str, id: str}
+
+        Returns:
+            PlanNotebook instance
+
+        Note:
+            The created PlanNotebook is NOT automatically bound to the agent.
+            Call set_plan_notebook() to bind it before executing the task.
+        """
+        from agentscope.plan import PlanNotebook
+
+        if self._plan_storage is None:
+            self.init_plan_storage()
+
+        plan_notebook = PlanNotebook(
+            plan_storage=self._plan_storage,
+            agent=self,
+        )
+
+        # Create the plan
+        await plan_notebook.create_plan(
+            name=name,
+            description=description,
+            expected_outcome=expected_outcome,
+            subtasks=subtasks,
+        )
+
+        logger.info(f"Created PlanNotebook '{name}' with {len(subtasks)} subtasks")
+        return plan_notebook
+
+    def set_plan_notebook(self, plan_notebook: Any | None) -> Any | None:
+        """Set (bind) a PlanNotebook to the agent.
+
+        Args:
+            plan_notebook: PlanNotebook instance to bind, or None to unbind
+
+        Returns:
+            The previous PlanNotebook instance (if any)
+
+        Note:
+            This is the key method for Task-level approach:
+            1. Master Skill saves the old value
+            2. Binds its own PlanNotebook
+            3. Executes the task
+            4. Restores the old value (unbinding)
+
+            Example:
+                old_plan = agent.set_plan_notebook(my_plan)
+                try:
+                    await execute_task()
+                finally:
+                    agent.set_plan_notebook(old_plan)
+        """
+        old_plan = getattr(self, "plan_notebook", None)
+        self.plan_notebook = plan_notebook
+
+        if plan_notebook:
+            logger.debug("Bound PlanNotebook to agent")
+        else:
+            logger.debug("Unbound PlanNotebook from agent")
+
+        return old_plan
+
+    async def archive_plan(
+        self,
+        plan_id: str,
+        state: Literal["completed", "archived", "cancelled"] = "completed",
+    ) -> bool:
+        """Archive a completed plan.
+
+        Args:
+            plan_id: Plan identifier
+            state: Final state (completed, archived, or cancelled)
+
+        Returns:
+            True if archived successfully
+        """
+        if self._plan_storage is None:
+            logger.warning("Cannot archive plan - plan_storage not initialized")
+            return False
+
+        success = await self._plan_storage.archive_plan(plan_id, state)
+        if success:
+            logger.info(f"Archived plan '{plan_id}' with state '{state}'")
+        return success
+
+    async def get_plan_status(self, plan_id: str) -> PlanData | None:
+        """Get the status of a plan.
+
+        Args:
+            plan_id: Plan identifier
+
+        Returns:
+            Plan data if found, None otherwise
+        """
+        if self._plan_storage is None:
+            return None
+        return await self._plan_storage.load_plan(plan_id)
+
+    async def list_plans(
+        self,
+        state: str | None = None,
+        limit: int | None = None,
+    ) -> list[PlanData]:
+        """List plans from storage.
+
+        Args:
+            state: Optional state filter
+            limit: Optional limit on results
+
+        Returns:
+            List of plan data
+        """
+        if self._plan_storage is None:
+            return []
+        return await self._plan_storage.list_plans(state=state, limit=limit)
+
+    def get_plan_storage(self) -> PlanStorage | None:
+        """Get the plan storage instance.
+
+        Returns:
+            Plan storage instance if initialized, None otherwise
+        """
+        return self._plan_storage
